@@ -1,5 +1,5 @@
 FoxUSB Sentinel X: The Ultimate Windows Security & Utility Tool
-​هذا الملخص مصمم ليتم وضعه في ملف README.md الخاص بالمستودع (Repository) لجذب المبرمجين والمستخدمين:
+​            README.>>Go
 ​Overview
 ​FoxUSB Sentinel X is a powerful, lightweight system utility and security suite developed using advanced Batch scripting. It is designed to bridge the gap between system optimization and real-time USB protection, offering a "Gold Master" level of stability and performance.
 ​Key Features
