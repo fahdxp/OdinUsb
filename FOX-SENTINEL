@@ -1,0 +1,606 @@
+@echo off
+setlocal enabledelayedexpansion
+:: ==============================================================================
+:: ULTIMATE FOX-SENTINEL SAFE EDITION v11.0 [GOLDEN-CORE - SAFE]
+:: PURPOSE  : Safe, non-destructive USB maintenance toolbox
+:: TARGET   : Removable USB drives only (tries to detect). Works on Windows XP/7/8/10/11
+:: SAFETY   : All destructive operations require explicit confirmation. No automatic diskpart changes.
+:: LOGGING  : Actions logged to %TEMP%\sentinel_safe.log and to "%USB_DRIVE%\Sentinel_Log" if writable.
+:: AUTHOR   : Copilot (prepared for user fahdxp)
+:: ==============================================================================
+:: Usage: Copy this file to the root of your USB flash drive and run it from there.
+:: IMPORTANT: Read prompts carefully. If a required tool is missing, the script will give safe alternatives.
+:: ==============================================================================
+
+:: ---------------------------
+:: Configuration / Variables
+:: ---------------------------
+set "SELF=%~f0"
+set "USB_DRIVE=%~d0"        :: e.g. "E:"
+set "USB_LETTER=%USB_DRIVE:~0,1%"  :: e.g. "E"
+set "LOGFILE=%TEMP%\sentinel_safe.log"
+set "TIMESTAMP=%DATE% %TIME%"
+set "VER=11.0-GOLDEN-SAFE"
+
+:: Initialize log
+echo [%TIMESTAMP%] Sentinel SAFE started on drive %USB_DRIVE% >> "%LOGFILE%"
+
+:: ---------------------------
+:: Helper Functions (batch)
+:: ---------------------------
+:PauseAndReturn
+    pause
+    goto Menu
+
+:Confirm
+    :: %1 = Prompt text (quoted), returns chosen answer in variable CONF_ANS (Y/N)
+    set "CONF_ANS="
+    set /p "CONF_ANS=%~1"
+    if /i "%CONF_ANS%"=="Y" goto :eof
+    if /i "%CONF_ANS%"=="N" goto :eof
+    :: normalize other inputs
+    if /i "%CONF_ANS:~0,1%"=="Y" goto :eof
+    set "CONF_ANS=N"
+    goto :eof
+
+:Log
+    :: %1 = message
+    set "LOGMSG=%~1"
+    echo [%DATE% %TIME%] %LOGMSG% >> "%LOGFILE%"
+    :: also attempt to write to USB if writable
+    if exist "%USB_DRIVE%\" (
+        if not exist "%USB_DRIVE%\Sentinel_Log" mkdir "%USB_DRIVE%\Sentinel_Log" 2>nul
+        if exist "%USB_DRIVE%\Sentinel_Log\" echo [%DATE% %TIME%] %LOGMSG% >> "%USB_DRIVE%\Sentinel_Log\sentinel.log" 2>nul
+    )
+    goto :eof
+
+:: ---------------------------
+:: Detect available tools
+:: ---------------------------
+where powershell >nul 2>&1 && set "HAS_PS=1" || set "HAS_PS=0"
+where wmic >nul 2>&1 && set "HAS_WMIC=1" || set "HAS_WMIC=0"
+where robocopy >nul 2>&1 && set "HAS_ROBOCOPY=1" || set "HAS_ROBOCOPY=0"
+where netsh >nul 2>&1 && set "HAS_NETSH=1" || set "HAS_NETSH=0"
+where tasklist >nul 2>&1 && set "HAS_TASKLIST=1" || set "HAS_TASKLIST=0"
+
+:: ---------------------------
+:: Drive-type detection (Removable check)
+:: Strategy:
+::  - Try PowerShell/Get-CimInstance (preferred)
+::  - Fallback to WMIC if no PowerShell
+::  - If both missing, ask user to confirm it's USB (safe fallback)
+:: DriveType = 2 => Removable
+:: ---------------------------
+set "DRIVETYPE="
+if "%HAS_PS%"=="1" (
+    for /f "usebackq tokens=* delims=" %%D in (`powershell -NoProfile -Command ^
+        "try { $d='%USB_DRIVE%'; $ld = Get-CimInstance -ClassName Win32_LogicalDisk -Filter \"DeviceID='$d'\" -ErrorAction SilentlyContinue; if ($ld) { $ld.DriveType } } catch { }" 2^>nul`) do (
+        set "DRIVETYPE=%%~D"
+    )
+) 
+
+if "%DRIVETYPE%"=="" if "%HAS_WMIC%"=="1" (
+    for /f "usebackq tokens=2 delims== " %%D in (`wmic logicaldisk where "DeviceID='%USB_DRIVE%'" get DriveType /value 2^>nul`) do (
+        if defined %%D set "DRIVETYPE=%%D"
+    ) 2>nul
+)
+
+if "%DRIVETYPE%"=="" (
+    :: Unknown drive type - ask user to confirm (safe path)
+    echo.
+    echo [!] Unable to automatically determine if %USB_DRIVE% is a removable USB drive.
+    echo     Please confirm that you are running this script from a removable USB flash drive.
+    call :Confirm "Confirm USB execution? (Y/N): "
+    if /i "%CONF_ANS%"=="Y" (
+        call :Log "User confirmed running from USB (manual)."
+    ) else (
+        echo Operation aborted. Run this script from the root of your USB flash drive.
+        call :Log "Aborted: user did not confirm USB."
+        pause
+        exit /b 1
+    )
+) else (
+    if "%DRIVETYPE%"=="2" (
+        call :Log "DriveType detected as Removable (2). Proceeding."
+    ) else (
+        echo.
+        echo [!] Detected drive type = %DRIVETYPE% (expected 2 for removable).
+        echo     This tool is intended for removable USB drives only.
+        echo.
+        call :Confirm "Continue anyway? (Y/N): "
+        if /i "%CONF_ANS%"=="Y" (
+            call :Log "User chose to continue despite non-removable drive detection (DriveType=%DRIVETYPE%)."
+        ) else (
+            call :Log "Aborted: non-removable drive and user chose not to continue."
+            echo Exiting.
+            pause
+            exit /b 1
+        )
+    )
+)
+
+:: ---------------------------
+:: Prevent running on SystemDrive (C:)
+:: ---------------------------
+if /i "%USB_DRIVE%"=="%SystemDrive%" (
+    echo [!] This script must NOT be run from the system drive (%SystemDrive%).
+    echo     Move it to your USB flash drive and run it from there.
+    call :Log "Aborted: script run from system drive."
+    pause
+    exit /b 1
+)
+
+:: ---------------------------
+:: Admin check and elevation (best-effort)
+:: ---------------------------
+net session >nul 2>&1
+if errorlevel 1 (
+    :: Not admin
+    if "%HAS_PS%"=="1" (
+        echo [*] Requesting elevation...
+        call :Log "Attempting to relaunch with admin rights via PowerShell."
+        powershell -NoProfile -Command "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c','\"%SELF%\"' -Verb RunAs" 2>nul
+        :: PowerShell Start-Process will open new window; exit current
+        exit /b 0
+    ) else (
+        echo.
+        echo [!] Administrator privileges are required for some operations.
+        echo     Please re-run this script by right-clicking and choosing "Run as administrator".
+        call :Log "User not admin and PowerShell unavailable for elevation. Exiting."
+        pause
+        exit /b 1
+    )
+) else (
+    call :Log "Running with administrator privileges."
+)
+
+:: ---------------------------
+:: OS detection (attempt robust methods)
+:: ---------------------------
+set "OS_VER=Unknown"
+if "%HAS_WMIC%"=="1" (
+    for /f "usebackq tokens=2 delims==" %%V in (`wmic os get Caption /value 2^>nul`) do (
+        set "OS_CAP=%%V"
+    )
+    for /f "usebackq tokens=2 delims==" %%V in (`wmic os get Version /value 2^>nul`) do (
+        set "OS_VERNUM=%%V"
+    )
+)
+if "%OS_VERNUM%"=="" (
+    for /f "tokens=4-5 delims=. " %%i in ('ver') do set "OS_VERNUM=%%i.%%j" 2>nul
+)
+if defined OS_VERNUM (
+    rem crude mapping
+    if "%OS_VERNUM%"=="5.1" set "OS_VER=Windows XP"
+    if "%OS_VERNUM%"=="6.0" set "OS_VER=Windows Vista"
+    if "%OS_VERNUM%"=="6.1" set "OS_VER=Windows 7"
+    if "%OS_VERNUM%"=="6.2" set "OS_VER=Windows 8"
+    if "%OS_VERNUM%"=="6.3" set "OS_VER=Windows 8.1"
+    if "%OS_VERNUM:~0,3%"=="10." set "OS_VER=Windows 10/11"
+)
+if "%OS_VER%"=="Unknown" (
+    set "OS_VER=%OS_CAP%"
+)
+call :Log "Detected OS: %OS_VER% (%OS_VERNUM%)."
+
+:: ---------------------------
+:: Menu
+:: ---------------------------
+:Menu
+cls
+echo.
+echo  ULTIMATE FOX-SENTINEL SAFE EDITION v%VER%
+echo  Drive: %USB_DRIVE%   OS: %OS_VER%
+echo  ====================================================================
+echo  [1] USB Immunizer (Safe vaccinate)         [7] Speed & UI Tweaks (non-destructive)
+echo  [2] Reveal Hidden Files (undo malware hide) [8] Hardware Diagnostics (report)
+echo  [3] Network Tools (show profiles / reset)   [9] MRT Quick Scan (if available)
+echo  [4] Windows Tools Launcher                   [10] Backup (safe, dry-run then run)
+echo  [5] Live Monitor (processes, top CPU)       [11] Lock Drive (read-only - safe method)
+echo  [6] System Repair (SFC + DISM where supported)
+echo.
+echo  [H] Help / Safety Info     [E] Exit
+echo  ====================================================================
+set /p "m=Choix: " 
+
+if /i "%m%"=="1" goto USBShield
+if /i "%m%"=="2" goto FileFix
+if /i "%m%"=="3" goto NetFix
+if /i "%m%"=="4" goto SmartControl
+if /i "%m%"=="5" goto LiveMonitor
+if /i "%m%"=="6" goto SystemRegen
+if /i "%m%"=="7" goto SpeedBooster
+if /i "%m%"=="8" goto Diagnose
+if /i "%m%"=="9" goto MRTScan
+if /i "%m%"=="10" goto SmartBackup
+if /i "%m%"=="11" goto LockDrive
+if /i "%m%"=="h" goto Help
+if /i "%m%"=="e" exit /b 0
+goto Menu
+
+:: ---------------------------
+:: 1) USB Immunizer (safe)
+:: ---------------------------
+:USBShield
+cls
+echo [*] USB Immunizer (SAFE) - prevents autorun.inf style autorun tricks
+echo.
+echo This will create a hidden system-protected folder named "autorun.inf" in the root of the USB.
+echo This is a non-destructive technique to block common autorun-based malware creating an autorun.inf file.
+call :Confirm "Proceed to create protected folder? (Y/N): "
+if /i "%CONF_ANS%"=="Y" (
+    if not exist "%USB_DRIVE%\autorun.inf" (
+        md "%USB_DRIVE%\autorun.inf" 2>nul
+        if exist "%USB_DRIVE%\autorun.inf" (
+            attrib +s +h +r "%USB_DRIVE%\autorun.inf" 2>nul
+            echo [V] Protected folder 'autorun.inf' created and attributes set.
+            call :Log "Created protected folder %USB_DRIVE%\autorun.inf"
+        ) else (
+            echo [!] Failed to create folder; ensure USB is writable.
+            call :Log "Failed to create autorun.inf folder on %USB_DRIVE%."
+        )
+    ) else (
+        echo [*] Folder already exists. Attributes will be ensured.
+        attrib +s +h +r "%USB_DRIVE%\autorun.inf" 2>nul
+        echo [V] Attributes set.
+        call :Log "Ensured attributes on %USB_DRIVE%\autorun.inf"
+    )
+) else (
+    echo Canceled by user.
+)
+pause
+goto Menu
+
+:: ---------------------------
+:: 2) Reveal Hidden Files
+:: ---------------------------
+:FileFix
+cls
+echo [*] Reveal hidden / system files on USB (may undo what some malware did)
+echo This will change attributes on files/folders on the USB only.
+call :Confirm "Remove Hidden/System/ReadOnly attributes recursively on the USB? (Y/N): "
+if /i "%CONF_ANS%"=="Y" (
+    echo [*] Running: attrib -s -h -r /s /d "%USB_DRIVE%\*.*"
+    call :Log "Executing attrib -s -h -r on %USB_DRIVE%"
+    attrib -s -h -r /s /d "%USB_DRIVE%\*.*" >nul 2>&1
+    echo [V] Attributes updated.
+    call :Log "Attributes updated on %USB_DRIVE%."
+) else (
+    echo Canceled by user.
+)
+pause
+goto Menu
+
+:: ---------------------------
+:: 3) Network Tools
+:: ---------------------------
+:NetFix
+cls
+echo Network Tools:
+echo  [1] List Wi-Fi profiles (names only)
+echo  [2] Show Wi-Fi profile details (instruction only - privacy sensitive)
+echo  [3] Reset network stack (winsock/ip/flushdns) [CONFIRM]
+echo  [B] Back
+set /p "n=Choice: "
+if /i "%n%"=="1" (
+    if "%HAS_NETSH%"=="1" (
+        echo [*] Listing Wi-Fi profiles (netsh wlan show profiles)...
+        netsh wlan show profiles
+        call :Log "Listed wifi profiles via netsh."
+    ) else (
+        echo [!] netsh not available on this system.
+        call :Log "netsh unavailable."
+    )
+    pause
+    goto NetFix
+)
+if /i "%n%"=="2" (
+    echo [!] Showing Wi-Fi keys is privacy-sensitive. This script will only show the instruction to view a profile key.
+    echo Use the following command to view a profile key (replace NAME):
+    echo     netsh wlan show profile name="NAME" key=clear
+    call :Log "Displayed instruction to show wifi profile key."
+    pause
+    goto NetFix
+)
+if /i "%n%"=="3" (
+    call :Confirm "This will reset the network stack (winsock & ip) and flush DNS. Continue? (Y/N): "
+    if /i "%CONF_ANS%"=="Y" (
+        echo [*] Resetting winsock...
+        netsh winsock reset
+        echo [*] Resetting IP...
+        netsh int ip reset
+        echo [*] Flushing DNS...
+        ipconfig /flushdns
+        echo [V] Network reset commands executed. Reboot recommended.
+        call :Log "Executed network reset commands."
+    ) else (
+        echo Canceled by user.
+    )
+    pause
+    goto NetFix
+)
+goto Menu
+
+:: ---------------------------
+:: 4) Windows Tools Launcher (safe open)
+:: ---------------------------
+:SmartControl
+cls
+echo Windows Tools:
+echo  [1] Task Manager    [2] Registry Editor  [3] Disk Management
+echo  [4] Services        [5] Control Panel   [B] Back
+set /p "s=Choice: "
+if "%s%"=="1" start "" taskmgr & call :Log "Launched Task Manager" & goto SmartControl
+if "%s%"=="2" start "" regedit & call :Log "Launched regedit" & goto SmartControl
+if "%s%"=="3" start "" diskmgmt.msc & call :Log "Launched Disk Management" & goto SmartControl
+if "%s%"=="4" start "" services.msc & call :Log "Launched Services" & goto SmartControl
+if "%s%"=="5" start "" control & call :Log "Launched Control Panel" & goto SmartControl
+goto Menu
+
+:: ---------------------------
+:: 5) Live Monitor
+:: ---------------------------
+:LiveMonitor
+cls
+echo Live Monitor - Top processes by CPU
+if "%HAS_TASKLIST%"=="1" (
+    if "%HAS_PS%"=="1" (
+        powershell -NoProfile -Command "Get-Process | Sort-Object CPU -Descending | Select-Object -First 15 Name,CPU" 2>nul || tasklist
+    ) else (
+        tasklist
+    )
+) else (
+    echo [!] Tasklist not available. Try opening Task Manager from Tools menu.
+)
+call :Log "Displayed live processes."
+pause
+goto Menu
+
+:: ---------------------------
+:: 6) System Repair (SFC + DISM where supported)
+:: ---------------------------
+:SystemRegen
+cls
+echo System Repair:
+echo  This will run SFC which checks system files. DISM is run only on Windows 8/10/11 where supported.
+call :Confirm "Run SFC (scan now)? (Y/N): "
+if /i "%CONF_ANS%"=="Y" (
+    echo [*] Running: sfc /scannow
+    sfc /scannow
+    call :Log "Executed sfc /scannow (exit %ERRORLEVEL%)."
+) else (
+    echo SFC canceled.
+)
+:: DISM only if not XP and DISM exists
+if not "%OS_VER%"=="Windows XP" (
+    where dism >nul 2>&1
+    if errorlevel 0 (
+        call :Confirm "Run DISM restorehealth (recommended on Windows 8/10/11)? (Y/N): "
+        if /i "%CONF_ANS%"=="Y" (
+            echo [*] Running: dism /online /cleanup-image /restorehealth
+            dism /online /cleanup-image /restorehealth
+            call :Log "Executed DISM restorehealth (exit %ERRORLEVEL%)."
+        ) else (
+            echo DISM canceled.
+        )
+    ) else (
+        echo [*] DISM not found on this system.
+    )
+)
+pause
+goto Menu
+
+:: ---------------------------
+:: 7) Speed & UI Tweaks (Non-destructive)
+:: ---------------------------
+:SpeedBooster
+cls
+echo Speed & UI Tweaks (non-destructive options; changes to HKCU or power plan require confirmation)
+echo  [1] Set menu show delay to 0 (quicker menus)
+echo  [2] Set 'High Performance' power plan (if available) - will only list and ask
+echo  [B] Back
+set /p "sb=Choice: "
+if /i "%sb%"=="1" (
+    call :Confirm "This will change HKCU\Control Panel\Desktop\MenuShowDelay to 0. Continue? (Y/N): "
+    if /i "%CONF_ANS%"=="Y" (
+        reg add "HKCU\Control Panel\Desktop" /v MenuShowDelay /t REG_SZ /d 0 /f >nul 2>&1
+        echo [V] Menu delay set to 0. You may need to log off/in to see full effect.
+        call :Log "Set MenuShowDelay=0 in HKCU."
+    ) else (
+        echo Canceled.
+    )
+    pause
+    goto SpeedBooster
+)
+if /i "%sb%"=="2" (
+    echo [*] Listing available power schemes...
+    powercfg -l 2>nul || echo [!] powercfg not available.
+    echo.
+    call :Confirm "Attempt to set High Performance (or Ultimate Performance) if present? (Y/N): "
+    if /i "%CONF_ANS%"=="Y" (
+        :: find a likely GUID (ultimate performance known guid provided)
+        for /f "tokens=*" %%G in ('powercfg -l 2^>nul ^| findstr /i "High performance"') do set "PP_LINE=%%G"
+        if defined PP_LINE (
+            for /f "tokens=2" %%P in ("!PP_LINE!") do set "PP_GUID=%%P"
+            powercfg /setactive %PP_GUID% 2>nul && echo [V] Power plan set. || echo [!] Failed to set power plan.
+            call :Log "Attempted to set power plan GUID %PP_GUID%."
+        ) else (
+            echo [!] Could not detect a 'High performance' plan. You can enable it via Windows power options.
+            call :Log "High Performance plan not found."
+        )
+    ) else (
+        echo Canceled.
+    )
+    pause
+    goto SpeedBooster
+)
+goto Menu
+
+:: ---------------------------
+:: 8) Hardware Diagnostics (reports)
+:: ---------------------------
+:Diagnose
+cls
+echo Hardware Diagnostics (report only)
+echo.
+if "%HAS_WMIC%"=="1" (
+    echo [+] Disk drives:
+    wmic diskdrive get model,status,size
+    echo.
+    echo [+] CPU:
+    wmic cpu get name,maxclockspeed
+    echo.
+    if "%OS_VER%"=="Windows 10/11" (
+        echo [+] Memory:
+        wmic memorychip get capacity,speed
+    )
+    call :Log "Displayed WMIC hardware info."
+) else (
+    echo [!] WMIC not available. Falling back to systeminfo (may be slower).
+    systeminfo | findstr /i "Processor" || echo [!] systeminfo not available.
+    call :Log "WMIC unavailable; used systeminfo fallback."
+)
+pause
+goto Menu
+
+:: ---------------------------
+:: 9) MRT Quick Scan (Microsoft Removal Tool) - best-effort
+:: ---------------------------
+:MRTScan
+cls
+echo MRT Quick Scan - Microsoft Malicious Removal Tool (if present)
+set "MRT_PATH=%windir%\system32\MRT.exe"
+if exist "%MRT_PATH%" (
+    echo [*] MRT detected at %MRT_PATH%
+    echo MRT can be run interactively. This script will launch MRT for you.
+    call :Confirm "Launch MRT interactive? (Y/N): "
+    if /i "%CONF_ANS%"=="Y" (
+        start "" "%MRT_PATH%"
+        call :Log "Launched MRT.exe interactively."
+    ) else (
+        echo Canceled.
+    )
+) else (
+    echo [!] MRT not found on this system.
+    echo You can download the latest MRT from Microsoft Update Catalog or Windows Update.
+    call :Log "MRT not found."
+)
+pause
+goto Menu
+
+:: ---------------------------
+:: 10) Smart Backup (safe: dry-run + run)
+:: ---------------------------
+:SmartBackup
+cls
+echo Smart Backup - Copy USB contents to a local folder (C:\Sentinel_Backup_%COMPUTERNAME%)
+set "BPATH=C:\Sentinel_Backup_%COMPUTERNAME%"
+echo Default backup path will be: %BPATH%
+echo.
+call :Confirm "Estimate size and list files to be copied (dry-run)? (Y/N): "
+if /i "%CONF_ANS%"=="Y" (
+    if "%HAS_ROBOCOPY%"=="1" (
+        echo [*] Dry-run with robocopy (list only)...
+        robocopy "%USB_DRIVE%\" "%BPATH%\" /E /L /NJH /NJS /NDL /MT:4
+        call :Log "Robocopy dry-run executed."
+    ) else (
+        echo [*] Robocopy not available. Listing files via dir...
+        dir "%USB_DRIVE%\" /s /b
+        call :Log "Listed files via dir for dry-run."
+    )
+) else (
+    echo Skipping dry-run.
+)
+echo.
+call :Confirm "Proceed to copy USB files to %BPATH%? (Y/N): "
+if /i "%CONF_ANS%"=="Y" (
+    if "%HAS_ROBOCOPY%"=="1" (
+        mkdir "%BPATH%" >nul 2>&1
+        echo [*] Running robocopy...
+        robocopy "%USB_DRIVE%\" "%BPATH%\" /E /Z /MT:8 /R:2 /W:5 /XD "%USB_DRIVE%\.core_sentinel" "%USB_DRIVE%\autorun.inf" 
+        echo [V] Backup complete.
+        call :Log "Robocopy completed to %BPATH%."
+    ) else (
+        echo [*] Robocopy not found. Using xcopy as fallback (less robust).
+        xcopy "%USB_DRIVE%\*" "%BPATH%\" /E /I /Y
+        echo [V] Backup complete (xcopy).
+        call :Log "Backup completed using xcopy."
+    )
+) else (
+    echo Backup canceled by user.
+)
+pause
+goto Menu
+
+:: ---------------------------
+:: 11) Lock Drive (attempt safe read-only)
+:: ---------------------------
+:LockDrive
+cls
+echo Lock Drive (Make the partition read-only) - SAFE approach
+echo NOTE: This operation may not be supported on all Windows versions. Script will attempt PowerShell Set-Partition (recommended) if available.
+echo On older Windows (XP) this operation is not supported via built-in safe methods - instructions will be provided instead.
+call :Confirm "Attempt to set the USB partition to ReadOnly (if supported)? (Y/N): "
+if /i "%CONF_ANS%"=="Y" (
+    if "%HAS_PS%"=="1" (
+        :: Try to run a PowerShell command to set partition readonly.
+        echo [*] Attempting PowerShell Set-Partition - requires Storage module and admin rights.
+        powershell -NoProfile -Command ^
+            "try { $d='%USB_LETTER%'; $p = Get-Partition -DriveLetter $d -ErrorAction SilentlyContinue; if ($p) { if (-not $p.IsReadOnly) { Set-Partition -DriveLetter $d -IsReadOnly $true; Write-Output 'OK' } else { Write-Output 'ALREADY' } } else { Write-Output 'NOPART' } } catch { Write-Output 'ERR' }" > "%TEMP%\ps_lock_result.txt" 2>&1
+        set /p PSR=<"%TEMP%\ps_lock_result.txt"
+        if /i "%PSR%"=="OK" (
+            echo [V] Partition set to ReadOnly.
+            call :Log "Set partition %USB_LETTER% to ReadOnly via PowerShell."
+        ) else if /i "%PSR%"=="ALREADY" (
+            echo [*] Partition was already ReadOnly.
+            call :Log "Partition already ReadOnly."
+        ) else if /i "%PSR%"=="NOPART" (
+            echo [!] Could not find a partition with drive letter %USB_LETTER%.
+            call :Log "PowerShell Set-Partition could not find partition for %USB_LETTER%."
+        ) else (
+            echo [!] PowerShell attempt failed or unsupported on this OS.
+            echo Please consult manual instructions below to set the volume read-only.
+            call :Log "PowerShell Set-Partition failed or unsupported (result=%PSR%)."
+        )
+        del "%TEMP%\ps_lock_result.txt" >nul 2>&1
+    ) else (
+        :: No PowerShell: cannot safely set partition read-only programmatically on older systems.
+        echo [!] PowerShell not available. Cannot set partition readonly safely.
+        echo Manual instructions:
+        echo  - On modern Windows: open an elevated PowerShell and run:
+        echo      Get-Partition -DriveLetter %USB_LETTER% | Set-Partition -IsReadOnly $true
+        echo  - On older Windows, consider using dedicated imaging/protection hardware or third-party tools.
+        call :Log "User attempted lock but PowerShell unavailable; provided manual instructions."
+    )
+) else (
+    echo Operation canceled by user.
+)
+pause
+goto Menu
+
+:: ---------------------------
+:: Help / Safety Info
+:: ---------------------------
+:Help
+cls
+echo Safety & Compatibility Notes:
+echo.
+echo  - This SAFE edition is designed to avoid automatic destructive actions.
+echo  - All operations that modify system or files ask for confirmation.
+echo  - diskpart is intentionally NOT used automatically; changing partitions can be destructive.
+echo  - On XP some modern tools (PowerShell, DISM, Set-Partition) may be unavailable.
+echo  - Always test on a non-critical machine or inside a VM before using on production systems.
+echo.
+echo Recommended workflow:
+echo  1) Use [1] USB Immunizer to protect against autorun tricks.
+echo  2) Use [2] Reveal Hidden Files to restore visibility of files.
+echo  3) Use [10] Smart Backup to copy USB contents locally (dry-run first).
+echo  4) Run anti-malware scans (MRT or third-party) and Windows System Repair.
+echo.
+echo Logging:
+echo  - Actions are logged to: %LOGFILE%
+echo  - If possible, logs are also written to: %USB_DRIVE%\Sentinel_Log\sentinel.log
+echo.
+echo Press any key to return to menu.
+pause >nul
+goto Menu
